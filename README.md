@@ -12,6 +12,7 @@ This project is a screen capture bot that detects changes in a specified area of
 - 감지 영역 및 체크 딜레이 설정
 - 스크린샷 저장 경로 선택 가능
 - 시간 간격마다 텔레그램 상태 메시지 전송
+- 변화 감지된 스크린샷 텔레그램 메시지 전송
 
 ## 설치 방법 (Installation)
 
