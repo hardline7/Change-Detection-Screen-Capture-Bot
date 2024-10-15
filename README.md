@@ -77,7 +77,7 @@
 
 2. 실행 파일 생성
    ```
-   pyinstaller --onefile --windowed screen_monitor.py
+   pyinstaller --onefile --windowed --hidden-import=PyQt5.QtWidgets --hidden-import=PyQt5.QtCore --hidden-import=PyQt5.QtGui --hidden-import=PIL.Image --hidden-import=PIL.ImageChops --hidden-import=pyautogui --hidden-import=requests --hidden-import=json --hidden-import=socket --hidden-import=datetime --hidden-import=time --hidden-import=os --hidden-import=sys --hidden-import=traceback screen_monitor.py
    ```
 
 3. `dist` 폴더 내의 실행 파일을 실행
