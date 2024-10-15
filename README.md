@@ -48,7 +48,7 @@
 
 2. 프로젝트 코드 다운로드 또는 클론
    ```
-   git clone https://github.com/your-username/screen-change-monitor.git
+   git clone https://github.com/hardline7/Change-Detection-Screen-Capture-Bot.git   
    cd screen-change-monitor
    ```
 
