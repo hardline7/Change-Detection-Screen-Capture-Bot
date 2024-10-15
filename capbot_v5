@@ -1,0 +1,496 @@
+# 코드의 간소화를 위해 asyncio와 비동기 메서드를 모두 제거하여 PyQt5에서 이벤트 루프와 관련된 문제를 방지했습니다.
+# asyncio, telegram, aiohttp와 관련된 임포트를 제거했습니다.
+# 비동기 방식으로 호출되던 Telegram API를 requests 라이브러리를 사용한 동기식 HTTP 요청으로 대체했습니다.
+# setup_telegram, send_telegram_message, send_telegram_screenshot_alert, _send_photo 메서드를 동기식 코드로 수정했습니다.
+# 더 이상 필요 없어진 run_async_task 메서드를 제거했습니다.
+# toggle_telegram_usage 메서드를 수정하여 체크박스 상태에 대해 정수형 및 불리언형 입력을 모두 처리할 수 있도록 했습니다.
+# toggle_monitoring 메서드가 동기식 send_start_message 메서드를 제대로 호출하도록 수정했습니다.
+# 동기식 코드 흐름에 맞게 오류 처리를 간소화했습니다.
+# closeEvent 메서드에서 이벤트 루프와 관련된 참조를 제거했습니다.
+# 이제 코드가 이벤트 루프 충돌 없이 정상적으로 작동하며, Telegram 메시지와 사진이 동기식 HTTP 요청을 통해 전송됩니다.
+
+import sys
+import os
+import time
+import traceback
+import requests
+import json
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QFileDialog,
+    QMessageBox, QSlider, QHBoxLayout, QLineEdit, QGroupBox, QFormLayout, QCheckBox
+)
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QRect
+from PyQt5.QtGui import QPainter, QPen
+from PIL import Image, ImageChops
+import pyautogui
+import socket
+import datetime
+
+class ScreenCaptureWidget(QWidget):
+    capture_completed = pyqtSignal(tuple)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setStyleSheet("background-color:black;")
+        self.setWindowOpacity(0.3)
+        self.setGeometry(QApplication.primaryScreen().geometry())
+        
+        self.begin = None
+        self.end = None
+        self.show()
+
+    def paintEvent(self, event):
+        if self.begin and self.end:
+            painter = QPainter(self)
+            painter.setPen(QPen(Qt.red, 3, Qt.SolidLine))
+            rect = QRect(self.begin, self.end)
+            painter.drawRect(rect)
+
+    def mousePressEvent(self, event):
+        self.begin = event.pos()
+        self.end = self.begin
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        self.end = event.pos()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.capture_completed.emit(self.getRect())
+        self.close()
+
+    def getRect(self):
+        return (
+            min(self.begin.x(), self.end.x()),
+            min(self.begin.y(), self.end.y()),
+            abs(self.end.x() - self.begin.x()),
+            abs(self.end.y() - self.begin.y())
+        )
+
+class ScreenMonitor(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.config_file = 'screen_monitor_config.json'
+        self.save_path = ""
+        self.monitor_area = None
+        self.pixel_threshold = 100
+        self.last_image = None
+        self.last_check_time = 0
+        self.last_save_time = 0
+        self.save_cooldown = 2
+        self.monitoring = False
+        self.chat_id = None
+        self.start_time = None
+        self.monitoring_was_active = False
+        self.default_bot_token = "your_default_bot_token"
+        self.default_chat_id = "your_default_chat_id"
+        self.use_telegram = False
+        self.bot_token = ''
+        self.load_config()
+        self.initUI()
+        self.show_guide()
+
+        if self.save_path and self.monitor_area and not self.monitoring:
+            self.toggle_monitoring()
+
+    def initUI(self):
+        self.setWindowTitle('변화감지 캡처봇 v0.0031')
+        self.setGeometry(100, 100, 400, 450)
+
+        layout = QVBoxLayout()
+
+        # Telegram 사용 여부 체크박스
+        self.use_telegram_checkbox = QCheckBox('Telegram 사용', self)
+        self.use_telegram_checkbox.setChecked(self.use_telegram)
+        self.use_telegram_checkbox.stateChanged.connect(self.toggle_telegram_usage)
+        layout.addWidget(self.use_telegram_checkbox)
+
+        telegram_group = QGroupBox("Telegram 설정")
+        telegram_layout = QFormLayout()
+
+        self.bot_token_input = QLineEdit(self)
+        self.bot_token_input.setEchoMode(QLineEdit.Password)
+        self.bot_token_input.setPlaceholderText("봇 토큰을 입력하세요")
+        telegram_layout.addRow(QLabel("봇 토큰:"), self.bot_token_input)
+
+        self.chat_id_input = QLineEdit(self)
+        self.chat_id_input.setPlaceholderText("챗 ID를 입력하세요")
+        telegram_layout.addRow(QLabel("챗 ID:"), self.chat_id_input)
+
+        self.save_telegram_btn = QPushButton('저장', self)
+        self.save_telegram_btn.clicked.connect(self.save_telegram_settings)
+        telegram_layout.addRow(self.save_telegram_btn)
+
+        self.delete_telegram_btn = QPushButton('삭제', self)
+        self.delete_telegram_btn.clicked.connect(self.delete_telegram_settings)
+        telegram_layout.addRow(self.delete_telegram_btn)
+
+        telegram_group.setLayout(telegram_layout)
+        layout.addWidget(telegram_group)
+
+        self.path_label = QLabel('저장 경로: 선택되지 않음', self)
+        layout.addWidget(self.path_label)
+
+        self.area_label = QLabel('감지 영역: 선택되지 않음', self)
+        layout.addWidget(self.area_label)
+
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel('픽셀 변화량 임계값:'))
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setMinimum(100)
+        self.threshold_slider.setMaximum(1000)
+        self.threshold_slider.setTickInterval(100)
+        self.threshold_slider.setValue(self.pixel_threshold)
+        self.threshold_slider.setTickPosition(QSlider.TicksBelow)
+        self.threshold_slider.valueChanged.connect(self.update_threshold)
+        threshold_layout.addWidget(self.threshold_slider)
+        self.threshold_label = QLabel(str(self.pixel_threshold))
+        threshold_layout.addWidget(self.threshold_label)
+        layout.addLayout(threshold_layout)
+
+        self.select_path_btn = QPushButton('저장 경로 선택', self)
+        self.select_path_btn.clicked.connect(self.select_save_path)
+        layout.addWidget(self.select_path_btn)
+
+        self.select_area_btn = QPushButton('감지 영역 선택', self)
+        self.select_area_btn.clicked.connect(self.select_area)
+        layout.addWidget(self.select_area_btn)
+
+        self.start_stop_btn = QPushButton('모니터링 시작', self)
+        self.start_stop_btn.clicked.connect(self.toggle_monitoring)
+        layout.addWidget(self.start_stop_btn)
+
+        self.status_label = QLabel('대기 중...', self)
+        layout.addWidget(self.status_label)
+
+        made_by_label = QLabel('Made by 충', self)
+        made_by_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        layout.addWidget(made_by_label)
+
+        self.setLayout(layout)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check_screen)
+
+        self.telegram_timer = QTimer(self)
+        self.telegram_timer.timeout.connect(self.send_telegram_status)
+        self.telegram_timer.start(3600000)
+
+        self.update_ui_from_config()
+
+    def load_config(self):
+        try:
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+            self.save_path = config.get('save_path', '')
+            self.monitor_area = tuple(config.get('monitor_area', (0, 0, 0, 0)))
+            self.pixel_threshold = config.get('pixel_threshold', 100)
+            self.bot_token = config.get('bot_token', self.default_bot_token)
+            self.chat_id = config.get('chat_id', self.default_chat_id)
+            self.monitoring_was_active = config.get('monitoring_was_active', False)
+            self.use_telegram = config.get('use_telegram', False)
+        except FileNotFoundError:
+            self.bot_token = self.default_bot_token
+            self.chat_id = self.default_chat_id
+
+    def save_config(self):
+        config = {
+            'save_path': self.save_path,
+            'monitor_area': self.monitor_area,
+            'pixel_threshold': self.pixel_threshold,
+            'bot_token': self.bot_token,
+            'chat_id': self.chat_id,
+            'monitoring_was_active': self.monitoring,
+            'use_telegram': self.use_telegram
+        }
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f)
+
+    def update_ui_from_config(self):
+        self.path_label.setText(f'저장 경로: {self.save_path or "선택되지 않음"}')
+        self.area_label.setText(f'감지 영역: {self.monitor_area or "선택되지 않음"}')
+        self.threshold_slider.setValue(self.pixel_threshold)
+        self.threshold_label.setText(str(self.pixel_threshold))
+        self.bot_token_input.setText(self.bot_token)
+        self.chat_id_input.setText(str(self.chat_id) if self.chat_id else '')
+        self.use_telegram_checkbox.setChecked(self.use_telegram)
+        self.toggle_telegram_usage(self.use_telegram)
+        self.check_start_conditions()
+
+    def toggle_telegram_usage(self, state):
+        if isinstance(state, int):
+            self.use_telegram = state == Qt.Checked
+        else:
+            self.use_telegram = state
+        self.bot_token_input.setEnabled(self.use_telegram)
+        self.chat_id_input.setEnabled(self.use_telegram)
+        self.save_telegram_btn.setEnabled(self.use_telegram)
+        self.delete_telegram_btn.setEnabled(self.use_telegram)
+        self.save_config()
+        self.check_start_conditions()
+
+    def show_guide(self):
+        guide_text = (
+            "사용법 안내\n\n"
+            "1. 스크린샷이 저장될 폴더를 지정하세요.\n"
+            "2. 변화를 감지할 영역을 드래그 하세요.\n"
+            "3. 픽셀 변화량 임계값을 설정하세요.\n"
+            "4. (선택사항) Telegram 사용을 체크하고 봇 토큰과 챗 ID를 입력하세요.\n"
+            "5. 모니터링 시작 버튼을 누르면 동작합니다.\n"
+        )
+        self.auto_close_message_box("사용법 안내", guide_text, 5000)
+
+    def auto_close_message_box(self, title, message, timeout=3000):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(message)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        QTimer.singleShot(timeout, msg_box.close)
+        msg_box.exec_()
+
+    def select_save_path(self):
+        self.save_path = QFileDialog.getExistingDirectory(self, '저장 경로 선택')
+        if self.save_path:
+            self.path_label.setText(f'저장 경로: {self.save_path}')
+            self.check_start_conditions()
+            self.save_config()
+
+    def select_area(self):
+        try:
+            self.hide()
+            self.capture_widget = ScreenCaptureWidget()
+            self.capture_widget.capture_completed.connect(self.onCaptureFinished)
+        except Exception as e:
+            self.show()
+            self.showErrorMessage("영역 선택 오류", f"영역 선택 중 오류가 발생했습니다: {str(e)}")
+
+    def onCaptureFinished(self, rect):
+        try:
+            self.monitor_area = rect
+            self.area_label.setText(f'감지 영역: {self.monitor_area}')
+            self.show()
+            self.check_start_conditions()
+            self.save_config()
+        except Exception as e:
+            self.showErrorMessage("영역 선택 완료 오류", f"영역 선택 완료 처리 중 오류가 발생했습니다: {str(e)}")
+
+    def update_threshold(self, value):
+        self.pixel_threshold = value
+        self.threshold_label.setText(str(value))
+        self.save_config()
+
+    def check_start_conditions(self):
+        telegram_condition = (not self.use_telegram) or (self.use_telegram and self.bot_token and self.chat_id)
+        self.start_stop_btn.setEnabled(bool(self.save_path and self.monitor_area and telegram_condition))
+
+    def toggle_monitoring(self):
+        try:
+            if not self.monitoring:
+                if self.use_telegram and (not self.bot_token or not self.chat_id):
+                    self.showErrorMessage("Telegram 설정 오류", "Telegram을 사용하려면 봇 토큰과 챗 ID를 먼저 설정하세요.")
+                    return
+                self.monitoring = True
+                self.start_stop_btn.setText('모니터링 중지')
+                self.timer.start(1000)
+                self.status_label.setText('모니터링 중...')
+                self.last_check_time = time.time()
+                self.start_time = time.time()
+                if self.use_telegram:
+                    self.send_start_message()
+            else:
+                self.monitoring = False
+                self.start_stop_btn.setText('모니터링 시작')
+                self.timer.stop()
+                self.status_label.setText('모니터링 중지됨')
+                if self.use_telegram:
+                    self.send_telegram_message("모니터링이 중지되었습니다.")
+            self.save_config()
+        except Exception as e:
+            self.showErrorMessage("모니터링 토글 오류", f"모니터링 상태 변경 중 오류가 발생했습니다: {str(e)}")
+
+    def check_screen(self):
+        try:
+            current_time = time.time()
+            if current_time - self.last_check_time < 1:
+                return
+
+            self.last_check_time = current_time
+            current_image = self.grab_screen(self.monitor_area)
+            
+            if current_image is not None and self.last_image is not None:
+                diff = ImageChops.difference(current_image, self.last_image)
+                bbox = diff.getbbox()
+                if bbox:
+                    diff_pixels = sum(diff.crop(bbox).convert("L").point(lambda p: p > 128).getdata())
+                    if diff_pixels > self.pixel_threshold:
+                        if current_time - self.last_save_time >= self.save_cooldown:
+                            filepath = self.save_screenshot(current_image)
+                            if self.use_telegram:
+                                self.send_telegram_screenshot_alert(filepath)
+                            self.last_save_time = current_time
+
+            self.last_image = current_image
+        except Exception as e:
+            self.showErrorMessage("화면 체크 오류", f"화면 체크 중 오류가 발생했습니다: {str(e)}")
+            self.monitoring = False
+            self.toggle_monitoring()
+
+    def grab_screen(self, bbox):
+        try:
+            left, top, width, height = bbox
+            screenshot = pyautogui.screenshot(region=(left, top, width, height))
+            return screenshot
+        except Exception as e:
+            self.showErrorMessage("스크린샷 캡처 오류", f"스크린샷 캡처 중 오류가 발생했습니다: {str(e)}")
+            return None
+
+    def save_screenshot(self, image):
+        try:
+            pc_name = socket.gethostname()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            sequence_number = 1
+            while True:
+                filename = f'{pc_name}_{timestamp}_{sequence_number}.png'
+                filepath = os.path.join(self.save_path, filename)
+                if not os.path.exists(filepath):
+                    break
+                sequence_number += 1
+            image.save(filepath)
+            self.status_label.setText(f'스크린샷 저장됨: {filepath}')
+            return filepath
+        except Exception as e:
+            self.showErrorMessage("스크린샷 저장 오류", f"스크린샷 저장 중 오류가 발생했습니다: {str(e)}")
+            return None
+
+    def showErrorMessage(self, title, message):
+        QMessageBox.critical(self, title, message)
+
+    def send_telegram_message(self, message):
+        if not self.use_telegram:
+            return
+        try:
+            if not self.bot_token or not self.chat_id:
+                return
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = {"chat_id": self.chat_id, "text": message}
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+        except Exception as e:
+            self.showErrorMessage("Telegram 오류", f"메시지 전송 중 오류가 발생했습니다: {str(e)}")
+
+    def send_telegram_screenshot_alert(self, filepath):
+        if not self.use_telegram:
+            return
+        if filepath:
+            message = f"화면 변화가 감지되어 스크린샷이 생성되었습니다.\n파일: {os.path.basename(filepath)}"
+            self.send_telegram_message(message)
+            try:
+                self._send_photo(filepath)
+            except Exception as e:
+                self.showErrorMessage("예상치 못한 오류", f"오류가 발생했습니다: {str(e)}")
+
+    def _send_photo(self, filepath):
+        if not self.use_telegram:
+            return
+        try:
+            if not self.bot_token or not self.chat_id:
+                return
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
+                    data = {"chat_id": self.chat_id}
+                    with open(filepath, 'rb') as photo_file:
+                        files = {"photo": photo_file}
+                        response = requests.post(url, data=data, files=files)
+                    response.raise_for_status()
+                    break  # 성공적으로 전송되면 루프 종료
+                except Exception as e:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt)  # 지수 백오프
+                    else:
+                        raise
+        except Exception as e:
+            self.showErrorMessage("Telegram 오류", f"스크린샷 전송 중 오류가 발생했습니다: {str(e)}")
+
+    def send_start_message(self):
+        if not self.use_telegram:
+            return
+        ip_address = self.get_ip_address()
+        message = f"화면 모니터링 프로그램이 시작되었습니다.\nIP 주소: {ip_address}"
+        self.send_telegram_message(message)
+
+    def get_ip_address(self):
+        try:
+            response = requests.get('https://api.ipify.org', timeout=5)
+            return response.text
+        except Exception:
+            return "IP 주소를 가져올 수 없습니다."
+
+    def send_telegram_status(self):
+        if self.use_telegram and self.monitoring and self.start_time:
+            hours = int((time.time() - self.start_time) / 3600)
+            self.send_telegram_message(f"{hours}시간째 정상 동작 중입니다.")
+
+    def save_telegram_settings(self):
+        bot_token = self.bot_token_input.text().strip()
+        chat_id = self.chat_id_input.text().strip()
+
+        if not bot_token or not chat_id:
+            self.showErrorMessage("입력 오류", "봇 토큰과 챗 ID를 모두 입력해야 합니다.")
+            return
+
+        try:
+            chat_id = int(chat_id)
+        except ValueError:
+            self.showErrorMessage("입력 오류", "챗 ID는 숫자여야 합니다.")
+            return
+
+        try:
+            self.bot_token = bot_token
+            self.chat_id = chat_id
+            # Test by sending a message
+            self.send_telegram_message("Telegram 설정이 성공적으로 저장되었습니다.")
+        except Exception as e:
+            self.showErrorMessage("Telegram 오류", f"Telegram 설정이 유효하지 않습니다: {str(e)}")
+            return
+
+        self.save_config()
+        self.check_start_conditions()
+        QMessageBox.information(self, "성공", "Telegram 설정이 저장되었습니다.")
+
+    def delete_telegram_settings(self):
+        reply = QMessageBox.question(
+            self, '삭제 확인',
+            "Telegram 설정을 정말 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self.bot_token = ''
+            self.chat_id = None
+            self.bot_token_input.clear()
+            self.chat_id_input.clear()
+            self.save_config()
+            self.check_start_conditions()
+            QMessageBox.information(self, "삭제 완료", "Telegram 설정이 삭제되었습니다.")
+
+    def closeEvent(self, event):
+        if self.monitoring:
+            self.toggle_monitoring()
+        event.accept()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    
+    try:
+        ex = ScreenMonitor()
+        ex.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"예상치 못한 오류가 발생했습니다: {str(e)}")
+        print("상세 오류 정보:")
+        print(traceback.format_exc())
+        QMessageBox.critical(None, "치명적 오류", f"프로그램 실행 중 치명적인 오류가 발생했습니다:\n{str(e)}")
+        sys.exit(1)
