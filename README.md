@@ -31,8 +31,14 @@
 8. **에러 처리 및 로깅**
    - 예외 상황에 대한 처리 및 사용자에게 알림
 
-9. **멀티플랫폼 지원**
-   - Windows, macOS, Linux 등 다양한 운영 체제에서 작동
+9. **윈도우만 지원**
+   
+
+![image](https://github.com/user-attachments/assets/3e43269c-9f21-45af-8a94-dbb2496e0a67)
+
+
+
+
 
 ## 설치 방법
 
