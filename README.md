@@ -49,7 +49,7 @@
 2. 프로젝트 코드 다운로드 또는 클론
    ```
    git clone https://github.com/hardline7/Change-Detection-Screen-Capture-Bot.git   
-   cd screen-change-monitor
+   cd Change-Detection-Screen-Capture-Bot
    ```
 
 3. 가상 환경 생성 및 활성화 (선택사항이지만 권장)
