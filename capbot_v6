@@ -1,5 +1,4 @@
 # 메시지 많이 발송면 텔레그램 막히니까 다량 메시지를 보내야 하는 환경에서 3개까지는 그냥 보내고 4개째 부터는 1분 후에 모아서 발송.
-
 import sys
 import os
 import time
@@ -529,8 +528,7 @@ if __name__ == '__main__':
         ex.show()
         sys.exit(app.exec_())
     except Exception as e:
-        print(f"예상치 못한 오류가 발생했습니다: {str(e)}")
-        print("상세 오류 정보:")
-        print(traceback.format_exc())
-        QMessageBox.critical(None, "치명적 오류", f"프로그램 실행 중 치명적인 오류가 발생했습니다:\n{str(e)}")
+        error_message = f"프로그램 실행 중 치명적인 오류가 발생했습니다:\n{str(e)}\n\n상세 오류 정보:\n{traceback.format_exc()}"
+        QMessageBox.critical(None, "치명적 오류", error_message)
         sys.exit(1)
+
