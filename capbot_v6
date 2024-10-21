@@ -6,21 +6,34 @@ import time
 import traceback
 import requests
 import json
+import threading  # threading 모듈 추가
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QFileDialog,
     QMessageBox, QSlider, QHBoxLayout, QLineEdit, QGroupBox, QFormLayout
 )
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QRect
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QRect, QEventLoop
 from PyQt5.QtGui import QPainter, QPen
 from PIL import Image, ImageChops
 import asyncio
-from telegram import Bot, InputMediaPhoto  # InputMediaPhoto 추가
-from telegram.ext import ApplicationBuilder
+from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
 import aiohttp
 import pyautogui
 import socket
 import datetime
+
+class AsyncioThread(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.loop = asyncio.new_event_loop()
+        self.daemon = True  # 프로그램 종료 시 스레드도 함께 종료되도록 설정
+
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
 
 class ScreenCaptureWidget(QWidget):
     capture_completed = pyqtSignal(tuple)
@@ -30,8 +43,14 @@ class ScreenCaptureWidget(QWidget):
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.setStyleSheet("background-color:black;")
         self.setWindowOpacity(0.3)
-        self.setGeometry(QApplication.primaryScreen().geometry())
-        
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            QMessageBox.critical(self, "오류", "스크린 정보를 가져올 수 없습니다.")
+            sys.exit(1)
+        else:
+            self.setGeometry(screen.geometry())
+
         self.begin = None
         self.end = None
         self.show()
@@ -77,10 +96,8 @@ class ScreenMonitor(QWidget):
         self.save_cooldown = 2
         self.monitoring = False
         self.bot = None
-        self.application = None
         self.chat_id = None
         self.start_time = None
-        self.loop = None
         self.monitoring_was_active = False
         self.default_bot_token = "your_default_bot_token"
         self.default_chat_id = "your_default_chat_id"
@@ -93,6 +110,10 @@ class ScreenMonitor(QWidget):
         self.accumulated_screenshots = []
         self.accumulation_timer = QTimer(self)
         self.accumulation_timer.timeout.connect(self.send_accumulated_screenshots)
+
+        # asyncio 이벤트 루프를 별도의 스레드에서 실행
+        self.asyncio_thread = AsyncioThread()
+        self.asyncio_thread.start()
 
         if self.save_path and self.monitor_area and not self.monitoring:
             self.toggle_monitoring()
@@ -265,15 +286,7 @@ class ScreenMonitor(QWidget):
         self.start_stop_btn.setEnabled(bool(self.save_path and self.monitor_area and self.bot_token and self.chat_id))
 
     async def setup_telegram(self):
-        connection_pool_size = 20
-        connect_timeout = 30.0
-        read_timeout = 30.0
-
-        conn = aiohttp.TCPConnector(limit=connection_pool_size)
-        session = aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=60, connect=connect_timeout, sock_read=read_timeout))
-        
-        self.application = ApplicationBuilder().token(self.bot_token).connect_timeout(connect_timeout).read_timeout(read_timeout).get_updates_http_version('1.1').build()
-        self.bot = self.application.bot
+        self.bot = Bot(token=self.bot_token)
 
     def toggle_monitoring(self):
         try:
@@ -315,18 +328,19 @@ class ScreenMonitor(QWidget):
                     if diff_pixels > self.pixel_threshold:
                         if current_time - self.last_save_time >= self.save_cooldown:
                             filepath = self.save_screenshot(current_image)
-                            self.message_count += 1  # 메시지 카운트 증가
-                            if self.message_count <= 3:
-                                # 1~3회차는 즉시 전송
-                                self.run_async_task(self.send_telegram_screenshot_alert(filepath))
-                            else:
-                                # 4회차부터는 누적
-                                self.accumulated_screenshots.append(filepath)
-                                if len(self.accumulated_screenshots) == 1:
-                                    # 첫 누적 시 타이머 시작
-                                    self.accumulation_timer.start(60000)  # 1분
-                            self.last_save_time = current_time
-            
+                            if filepath:  # Ensure filepath is valid
+                                self.message_count += 1  # 메시지 카운트 증가
+                                if self.message_count <= 3:
+                                    # 1~3회차는 즉시 전송
+                                    self.run_async_task(self.send_telegram_screenshot_alert(filepath))
+                                else:
+                                    # 4회차부터는 누적
+                                    self.accumulated_screenshots.append(filepath)
+                                    if len(self.accumulated_screenshots) == 1:
+                                        # 첫 누적 시 타이머 시작
+                                        self.accumulation_timer.start(60000)  # 1분
+                                self.last_save_time = current_time
+
             self.last_image = current_image
         except Exception as e:
             self.showErrorMessage("화면 체크 오류", f"화면 체크 중 오류가 발생했습니다: {str(e)}")
@@ -338,7 +352,7 @@ class ScreenMonitor(QWidget):
             left, top, width, height = bbox
             screenshot = pyautogui.screenshot(region=(left, top, width, height))
             return screenshot
-        except Exception as e:  
+        except Exception as e:
             self.showErrorMessage("스크린샷 캡처 오류", f"스크린샷 캡처 중 오류가 발생했습니다: {str(e)}")
             return None
 
@@ -464,22 +478,12 @@ class ScreenMonitor(QWidget):
             QMessageBox.information(self, "삭제 완료", "Telegram 설정이 삭제되었습니다.")
 
     def run_async_task(self, coro):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(coro)
-            else:
-                loop.run_until_complete(coro)
-        except RuntimeError:
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            new_loop.run_until_complete(coro)
+        asyncio.run_coroutine_threadsafe(coro, self.asyncio_thread.loop)
 
     def closeEvent(self, event):
         if self.monitoring:
             self.toggle_monitoring()
-        if self.loop and not self.loop.is_closed():
-            self.loop.close()
+        self.asyncio_thread.stop()
         event.accept()
 
     def send_accumulated_screenshots(self):
@@ -494,19 +498,23 @@ class ScreenMonitor(QWidget):
         self.accumulation_timer.stop()
 
     async def send_telegram_multiple_screenshots(self, message, filepaths):
+        if not filepaths:
+            return  # Add check to prevent iteration over None
         try:
             if not self.bot:
                 await self.setup_telegram()
             media = []
             files = []
             for filepath in filepaths[:10]:  # 최대 10개까지 전송
-                photo = open(filepath, 'rb')
-                files.append(photo)
-                if len(media) == 0:
-                    media.append(InputMediaPhoto(photo, caption=message))
-                else:
-                    media.append(InputMediaPhoto(photo))
-            await self.bot.send_media_group(chat_id=self.chat_id, media=media)
+                if os.path.exists(filepath):
+                    photo = open(filepath, 'rb')
+                    files.append(photo)
+                    if len(media) == 0:
+                        media.append(InputMediaPhoto(photo, caption=message))
+                    else:
+                        media.append(InputMediaPhoto(photo))
+            if media:
+                await self.bot.send_media_group(chat_id=self.chat_id, media=media)
             # 파일 객체 닫기
             for f in files:
                 f.close()
