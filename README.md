@@ -34,12 +34,6 @@
 9. **윈도우만 지원**
    
 
-![image](https://github.com/user-attachments/assets/3e43269c-9f21-45af-8a94-dbb2496e0a67)
-
-
-
-
-
 ## 설치 방법
 
 ### 방법 1: Python 환경에서 직접 실행
