@@ -1,5 +1,3 @@
-#매 시간마다 정상동작 메시지 보낼때, 시스템 로그도 보내도록 수정
-#gui창에 로그 보는 기능 추가, 동작할때마다 로그 생성.
 import sys
 import os
 import time
@@ -23,6 +21,7 @@ import aiohttp
 import pyautogui
 import socket
 import datetime
+from contextlib import ExitStack
 
 class AsyncioThread(threading.Thread):
     def __init__(self):
@@ -86,6 +85,8 @@ class ScreenCaptureWidget(QWidget):
         )
 
 class ScreenMonitor(QWidget):
+    error_occurred = pyqtSignal(str, str)  # Define a custom signal for errors
+
     def __init__(self):
         super().__init__()
         self.config_file = 'screen_monitor_config.json'
@@ -136,8 +137,10 @@ class ScreenMonitor(QWidget):
                 f.write('')
 
     def initUI(self):
-        self.setWindowTitle('변화감지 캡처봇 v0.0030')
+        self.setWindowTitle('변화감지 캡처봇 v0.0051')
         self.setGeometry(100, 100, 400, 400)
+
+        self.error_occurred.connect(self.showErrorMessage)  # Connect the error signal
 
         layout = QVBoxLayout()
 
@@ -424,9 +427,11 @@ class ScreenMonitor(QWidget):
                 await self.setup_telegram()
             await self.bot.send_message(chat_id=self.chat_id, text=message)
         except TelegramError as e:
-            self.showErrorMessage("Telegram 오류", f"메시지 전송 중 오류가 발생했습니다: {str(e)}")
+            # Use signal to communicate error to main thread
+            self.error_occurred.emit("Telegram 오류", f"메시지 전송 중 오류가 발생했습니다: {str(e)}")
+            self.log_error_to_file(traceback.format_exc())
         except Exception as e:
-            self.showErrorMessage("예상치 못한 오류", f"오류가 발생했습니다: {str(e)}")
+            self.error_occurred.emit("예상치 못한 오류", f"오류가 발생했습니다: {str(e)}")
             self.log_error_to_file(traceback.format_exc())
 
     async def send_telegram_screenshot_alert(self, filepath):
@@ -435,7 +440,7 @@ class ScreenMonitor(QWidget):
             try:
                 await self._send_photo(filepath, caption=message)
             except Exception as e:
-                self.showErrorMessage("예상치 못한 오류", f"오류가 발생했습니다: {str(e)}")
+                self.error_occurred.emit("예상치 못한 오류", f"오류가 발생했습니다: {str(e)}")
                 self.log_error_to_file(traceback.format_exc())
 
     async def _send_photo(self, filepath, caption=None):
@@ -454,7 +459,8 @@ class ScreenMonitor(QWidget):
                     else:
                         raise
         except Exception as e:
-            self.showErrorMessage("Telegram 오류", f"스크린샷 전송 중 오류가 발생했습니다: {str(e)}")
+            # Use signal to communicate error to main thread
+            self.error_occurred.emit("Telegram 오류", f"스크린샷 전송 중 오류가 발생했습니다: {str(e)}")
             self.log_error_to_file(traceback.format_exc())
 
     async def send_start_message(self):
@@ -557,27 +563,33 @@ class ScreenMonitor(QWidget):
 
     async def send_telegram_multiple_screenshots(self, message, filepaths):
         if not filepaths:
-            return  # Add check to prevent iteration over None
+            return
         try:
             if not self.bot:
                 await self.setup_telegram()
-            media = []
-            files = []
-            for filepath in filepaths[:10]:  # 최대 10개까지 전송
-                if os.path.exists(filepath):
-                    photo = open(filepath, 'rb')
-                    files.append(photo)
-                    if len(media) == 0:
-                        media.append(InputMediaPhoto(photo, caption=message))
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    media = []
+                    with ExitStack() as stack:
+                        for filepath in filepaths[:10]:  # 최대 10개까지 전송
+                            if os.path.exists(filepath):
+                                photo = stack.enter_context(open(filepath, 'rb'))
+                                if len(media) == 0:
+                                    media.append(InputMediaPhoto(photo, caption=message))
+                                else:
+                                    media.append(InputMediaPhoto(photo))
+                        if media:
+                            await self.bot.send_media_group(chat_id=self.chat_id, media=media)
+                    break  # 성공적으로 전송되면 루프 종료
+                except (asyncio.TimeoutError, TelegramError) as e:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # 지수 백오프
                     else:
-                        media.append(InputMediaPhoto(photo))
-            if media:
-                await self.bot.send_media_group(chat_id=self.chat_id, media=media)
-            # 파일 객체 닫기
-            for f in files:
-                f.close()
+                        raise
         except Exception as e:
-            self.showErrorMessage("Telegram 오류", f"다중 스크린샷 전송 중 오류가 발생했습니다: {str(e)}")
+            # Use signal to communicate error to main thread
+            self.error_occurred.emit("Telegram 오류", f"다중 스크린샷 전송 중 오류가 발생했습니다: {str(e)}")
             self.log_error_to_file(traceback.format_exc())
 
     # 로그 보기 메서드 추가
